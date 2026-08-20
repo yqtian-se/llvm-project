@@ -224,6 +224,8 @@ mlir::memref::multiBuffer(RewriterBase &rewriter, memref::AllocOp allocOp,
   Location loc = allocOp->getLoc();
   OpBuilder::InsertionGuard g(rewriter);
   rewriter.setInsertionPoint(allocOp);
+  memref::AllocOp::Properties properties = allocOp.getProperties();
+  properties.operandSegmentSizes = {0, 0};
   auto mbAlloc = memref::AllocOp::create(
       rewriter, loc, mbMemRefType, ValueRange{}, allocOp.getAlignmentAttr());
   mbAlloc->setDiscardableAttrs(allocOp->getDiscardableAttrDictionary());
