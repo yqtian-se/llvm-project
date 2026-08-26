@@ -121,6 +121,7 @@ class VPPredicator {
   /// Create a logical-or, factoring out a common header mask if present.
   VPValue *createMaskOr(VPValue *LHS, VPValue *RHS, DebugLoc DL);
 
+  VPValue *reconstructSSA(VPBasicBlock *UseBB, VPValue *V, bool IsMask);
   void fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask);
   bool shouldPreserveTerminator(VPBasicBlock *VPBB);
 
@@ -230,10 +231,11 @@ VPValue *VPPredicator::createMaskOr(VPValue *LHS, VPValue *RHS, DebugLoc DL) {
       HeaderMask, Builder.createOr(LHSRemainder, RHSRemainder, DL), DL);
 }
 
-void VPPredicator::fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask) {
+VPValue *VPPredicator::reconstructSSA(VPBasicBlock *UseBB, VPValue *V,
+                                       bool IsMask) {
   auto *RecipeValue = dyn_cast<VPRecipeValue>(V);
   if (!RecipeValue)
-    return;
+    return V;
 
   auto &SSADefs = SSAReconstructionDefsMap[RecipeValue];
   VPBasicBlock *DefBB = RecipeValue->getDefiningRecipe()->getParent();
@@ -242,8 +244,12 @@ void VPPredicator::fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask) {
   if (DefBB != Header)
     SSADefs[Header] =
         IsMask ? Plan.getFalse() : Plan.getPoison(RecipeValue->getScalarType());
-  auto *Fixed = vputils::reconstructSSA(U->getParent(), SSADefs);
-  if (Fixed == RecipeValue)
+  return vputils::reconstructSSA(UseBB, SSADefs);
+}
+
+void VPPredicator::fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask) {
+  VPValue *Fixed = reconstructSSA(U->getParent(), V, IsMask);
+  if (Fixed == V)
     return;
 
   LLVM_DEBUG({
@@ -254,7 +260,7 @@ void VPPredicator::fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask) {
     dbgs() << " with ";
     Fixed->dump();
   });
-  U->replaceUsesOfWith(RecipeValue, Fixed);
+  U->replaceUsesOfWith(V, Fixed);
 }
 
 bool VPPredicator::shouldPreserveTerminator(VPBasicBlock *VPBB) {
@@ -527,8 +533,11 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
   Builder.setInsertPoint(VPBB, getMaskInsertPoint(VPBB));
 
   SmallVector<VPPhi *> Phis;
-  for (VPRecipeBase &R : VPBB->phis())
-    Phis.push_back(cast<VPPhi>(&R));
+  for (VPRecipeBase &R : VPBB->phis()) {
+    auto *Phi = cast<VPPhi>(&R);
+    if (!Phi->isSSAReconstructionPhi())
+      Phis.push_back(Phi);
+  }
   for (VPPhi *PhiR : Phis) {
     LLVM_DEBUG(dbgs() << "Converting " << *PhiR << " to blend\n");
     // The non-header Phi is converted into a Blend recipe below,
@@ -559,8 +568,25 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
     for (auto [V, ConstMaskBlock] : Terms->second) {
       auto *MaskBlock = const_cast<VPBasicBlock *>(ConstMaskBlock);
       MaskBlocks.push_back(MaskBlock);
+
+      // Reconstruct values at the blend location rather than fixing up the
+      // blend after it has been created.
+      V = reconstructSSA(VPBB, V, /*IsMask=*/false);
+
       VPValue *Mask = getBlockInMask(MaskBlock);
-      OperandsWithMask.append({V, Mask ? Mask : Plan.getTrue()});
+      if (Mask) {
+        Mask = reconstructSSA(VPBB, Mask, /*IsMask=*/true);
+      } else {
+        // The all-true mask only applies from MaskBlock. Model it explicitly
+        // with false at the header and true at MaskBlock before reconstructing
+        // it at the blend location.
+        DenseMap<VPBasicBlock *, VPValue *> TrueMaskDefs;
+        TrueMaskDefs[Plan.getVectorLoopRegion()->getEntryBasicBlock()] =
+            Plan.getFalse();
+        TrueMaskDefs[MaskBlock] = Plan.getTrue();
+        Mask = vputils::reconstructSSA(VPBB, TrueMaskDefs);
+      }
+      OperandsWithMask.append({V, Mask});
     }
 
     // Remove a common dominator mask from all blend masks. Doing this here
@@ -570,6 +596,7 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
             make_range(MaskBlocks.begin(), MaskBlocks.end())));
     VPValue *CommonMask = getBlockInMask(CommonDom);
     if (CommonMask) {
+      CommonMask = reconstructSSA(VPBB, CommonMask, /*IsMask=*/true);
       SmallVector<VPValue *, 2> SimplifiedOperands;
       bool RemovedMask = false;
       for (unsigned I = 0; I < OperandsWithMask.size(); I += 2) {
@@ -747,30 +774,15 @@ void VPPredicator::run() {
   }
 
   LLVM_DEBUG({
-    dbgs() << "VPlan before predicating phis:\n";
+    dbgs() << "VPlan before predicating phis and ssa fixup:\n";
     Plan.dump();
   });
-  for (VPBlockBase *VPBB : reverse(BlocksInCompactRPOTOrder))
+  for (VPBlockBase *VPBB : reverse(BlocksInCompactRPOTOrder)) {
+
     if (VPBB != Header)
       convertPhisToBlends(cast<VPBasicBlock>(VPBB));
 
-  LLVM_DEBUG({
-    dbgs() << "VPlan before SSA-fixup:\n";
-    Plan.dump();
-  });
-
-  for (VPBasicBlock *VPBB :
-       VPBlockUtils::blocksOnly<VPBasicBlock>(BlocksInCompactRPOTOrder)) {
-    for (VPRecipeBase &R : *VPBB) {
-      if (auto *Blend = dyn_cast<VPBlendRecipe>(&R)) {
-        // TODO: We can probably do better than this by performing partial
-        // blends along the path and have at most one phi per blend in a given
-        // basic block.
-        for (unsigned I = 0; I < Blend->getNumIncomingValues(); ++I) {
-          fixSSA(Blend, Blend->getIncomingValue(I), /*IsMask*/ false);
-          fixSSA(Blend, Blend->getMask(I), /*IsMask*/ true);
-        }
-      }
+    for (VPRecipeBase &R : *cast<VPBasicBlock>(VPBB)) {
       auto *I = dyn_cast<VPInstruction>(&R);
       if (!I)
         continue;
