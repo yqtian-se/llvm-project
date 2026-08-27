@@ -122,6 +122,8 @@ class VPPredicator {
   VPValue *createMaskOr(VPValue *LHS, VPValue *RHS, DebugLoc DL);
 
   VPValue *reconstructSSA(VPBasicBlock *UseBB, VPValue *V, bool IsMask);
+  VPValue *reconstructBlendMask(VPBasicBlock *UseBB,
+                                VPBasicBlock *MaskBlock);
   void fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask);
   bool shouldPreserveTerminator(VPBasicBlock *VPBB);
 
@@ -245,6 +247,21 @@ VPValue *VPPredicator::reconstructSSA(VPBasicBlock *UseBB, VPValue *V,
     SSADefs[Header] =
         IsMask ? Plan.getFalse() : Plan.getPoison(RecipeValue->getScalarType());
   return vputils::reconstructSSA(UseBB, SSADefs);
+}
+
+VPValue *VPPredicator::reconstructBlendMask(VPBasicBlock *UseBB,
+                                              VPBasicBlock *MaskBlock) {
+  VPValue *Mask = getBlockInMask(MaskBlock);
+  if (!Mask)
+    Mask = Plan.getTrue();
+
+  // The mask is only valid along paths from MaskBlock. Make that explicit
+  // before reconstructing it at the blend location.
+  DenseMap<VPBasicBlock *, VPValue *> BlendMaskDefs;
+  BlendMaskDefs[Plan.getVectorLoopRegion()->getEntryBasicBlock()] =
+      Plan.getFalse();
+  BlendMaskDefs[MaskBlock] = Mask;
+  return vputils::reconstructSSA(UseBB, BlendMaskDefs);
 }
 
 void VPPredicator::fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask) {
@@ -573,20 +590,7 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
       // blend after it has been created.
       V = reconstructSSA(VPBB, V, /*IsMask=*/false);
 
-      VPValue *Mask = getBlockInMask(MaskBlock);
-      if (Mask) {
-        Mask = reconstructSSA(VPBB, Mask, /*IsMask=*/true);
-      } else {
-        // The all-true mask only applies from MaskBlock. Model it explicitly
-        // with false at the header and true at MaskBlock before reconstructing
-        // it at the blend location.
-        DenseMap<VPBasicBlock *, VPValue *> TrueMaskDefs;
-        TrueMaskDefs[Plan.getVectorLoopRegion()->getEntryBasicBlock()] =
-            Plan.getFalse();
-        TrueMaskDefs[MaskBlock] = Plan.getTrue();
-        Mask = vputils::reconstructSSA(VPBB, TrueMaskDefs);
-      }
-      OperandsWithMask.append({V, Mask});
+      OperandsWithMask.append({V, reconstructBlendMask(VPBB, MaskBlock)});
     }
 
     // Remove a common dominator mask from all blend masks. Doing this here
@@ -594,9 +598,8 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
     VPBasicBlock *CommonDom =
         cast<VPBasicBlock>(VPDT.findNearestCommonDominator(
             make_range(MaskBlocks.begin(), MaskBlocks.end())));
-    VPValue *CommonMask = getBlockInMask(CommonDom);
-    if (CommonMask) {
-      CommonMask = reconstructSSA(VPBB, CommonMask, /*IsMask=*/true);
+    if (VPValue *CommonMask = getBlockInMask(CommonDom)) {
+      CommonMask = reconstructBlendMask(VPBB, CommonDom);
       SmallVector<VPValue *, 2> SimplifiedOperands;
       bool RemovedMask = false;
       for (unsigned I = 0; I < OperandsWithMask.size(); I += 2) {
