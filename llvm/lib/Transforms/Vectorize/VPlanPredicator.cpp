@@ -123,7 +123,7 @@ class VPPredicator {
 
   VPValue *reconstructSSA(VPBasicBlock *UseBB, VPValue *V, bool IsMask);
   VPValue *reconstructBlendMask(VPBasicBlock *UseBB,
-                                VPBasicBlock *MaskBlock);
+                                VPBasicBlock *MaskBlock, VPValue *Mask);
   void fixSSA(VPRecipeBase *U, VPValue *V, bool IsMask);
   bool shouldPreserveTerminator(VPBasicBlock *VPBB);
 
@@ -250,8 +250,8 @@ VPValue *VPPredicator::reconstructSSA(VPBasicBlock *UseBB, VPValue *V,
 }
 
 VPValue *VPPredicator::reconstructBlendMask(VPBasicBlock *UseBB,
-                                              VPBasicBlock *MaskBlock) {
-  VPValue *Mask = getBlockInMask(MaskBlock);
+                                              VPBasicBlock *MaskBlock,
+                                              VPValue *Mask) {
   if (!Mask)
     Mask = Plan.getTrue();
 
@@ -582,49 +582,35 @@ void VPPredicator::convertPhisToBlends(VPBasicBlock *VPBB) {
         BlendTerms[BlocksInCompactRPOTOrder.getIndex(VPBB)];
     auto Terms = BlockBlendTerms.find(PhiR);
     assert(Terms != BlockBlendTerms.end() && "Missing cached blend terms");
+    for (auto [_, ConstMaskBlock] : Terms->second)
+      MaskBlocks.push_back(const_cast<VPBasicBlock *>(ConstMaskBlock));
+
+    // The in-mask of the common dominator is true on all paths from an
+    // incoming block to the phi. Remove it before reconstructing the masks,
+    // which may otherwise obscure the common subexpression with SSA phis.
+    VPBasicBlock *CommonIncomingDom =
+        cast<VPBasicBlock>(VPDT.findNearestCommonDominator(
+            make_range(MaskBlocks.begin(), MaskBlocks.end())));
+    VPValue *CommonIncomingMask = getBlockInMask(CommonIncomingDom);
+
     for (auto [V, ConstMaskBlock] : Terms->second) {
       auto *MaskBlock = const_cast<VPBasicBlock *>(ConstMaskBlock);
-      MaskBlocks.push_back(MaskBlock);
 
       // Reconstruct values at the blend location rather than fixing up the
       // blend after it has been created.
       V = reconstructSSA(VPBB, V, /*IsMask=*/false);
 
-      OperandsWithMask.append({V, reconstructBlendMask(VPBB, MaskBlock)});
-    }
-
-    // Remove a common dominator mask from all blend masks. Doing this here
-    // avoids constructing masks that will be removed later by simplifyBlends.
-    VPBasicBlock *CommonDom =
-        cast<VPBasicBlock>(VPDT.findNearestCommonDominator(
-            make_range(MaskBlocks.begin(), MaskBlocks.end())));
-    if (VPValue *CommonMask = getBlockInMask(CommonDom)) {
-      CommonMask = reconstructBlendMask(VPBB, CommonDom);
-      SmallVector<VPValue *, 2> SimplifiedOperands;
-      bool RemovedMask = false;
-      for (unsigned I = 0; I < OperandsWithMask.size(); I += 2) {
-        VPValue *Incoming = OperandsWithMask[I];
-        VPValue *Mask = OperandsWithMask[I + 1];
-        VPValue *RemainingMask = nullptr;
-
-        // foldTailByMasking() uses poison instead of the correct recurrence
-        // phi value in the vector latch.
-        if (auto *Def = Incoming->getDefiningRecipe();
-            Def && Def->getParent() ==
-                       Plan.getVectorLoopRegion()->getEntryBasicBlock()) {
-          SimplifiedOperands.clear();
-          break;
-        }
-        if (!match(Mask, m_RemoveMask(CommonMask, RemainingMask))) {
-          SimplifiedOperands.clear();
-          break;
-        }
-        SimplifiedOperands.append(
-            {Incoming, RemainingMask ? RemainingMask : Plan.getTrue()});
-        RemovedMask |= RemainingMask != nullptr;
-      }
-      if (RemovedMask && !SimplifiedOperands.empty())
-        OperandsWithMask = std::move(SimplifiedOperands);
+      VPValue *Mask = getBlockInMask(MaskBlock);
+      VPValue *RemainingMask = nullptr;
+      bool RemovedCommonMask =
+          CommonIncomingMask && Mask &&
+          match(Mask, m_RemoveMask(CommonIncomingMask, RemainingMask));
+      OperandsWithMask.append(
+          {V, RemovedCommonMask && !RemainingMask
+                  ? Plan.getTrue()
+                  : reconstructBlendMask(VPBB, MaskBlock,
+                                         RemovedCommonMask ? RemainingMask
+                                                           : Mask)});
     }
 
     PHINode *IRPhi = cast_or_null<PHINode>(PhiR->getUnderlyingValue());
